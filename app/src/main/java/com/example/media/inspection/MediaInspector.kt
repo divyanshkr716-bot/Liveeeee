@@ -39,7 +39,111 @@ class MediaInspector(private val context: Context) {
         var audioTrackIndex = -1
         var measuredKeyframeIntervalSec: Double? = null
         var isContinuous = true
-        extractor.selectTrack(videoTrackIndex)
+
+        try {
+            // Step 1: Open DataSource with strict isolation between extractor and retriever
+            if (uri.scheme == "file" || uri.scheme == null) {
+                val filePath = uri.path ?: ""
+                val file = File(filePath)
+                if (!file.exists() || !file.canRead()) {
+                    throw java.io.FileNotFoundException("Local video file not found or unreadable: $filePath")
+                }
+                extractor.setDataSource(file.absolutePath)
+                retriever.setDataSource(file.absolutePath)
+            } else if (uri.scheme == "content" || uri.scheme == "android.resource") {
+                // Open separate PFDs so retriever seeks don't corrupt extractor position
+                pfdExtractor = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
+                pfdRetriever = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
+
+                if (pfdExtractor != null && pfdRetriever != null) {
+                    extractor.setDataSource(pfdExtractor.fileDescriptor)
+                    retriever.setDataSource(pfdRetriever.fileDescriptor)
+                } else {
+                    extractor.setDataSource(context, uri, null)
+                    retriever.setDataSource(context, uri)
+                }
+            } else {
+                val path = uri.path ?: uri.toString()
+                extractor.setDataSource(path)
+                retriever.setDataSource(path)
+            }
+
+            // Step 2: Extract container metadata via MediaMetadataRetriever
+            val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            if (!durStr.isNullOrEmpty()) {
+                durationMs = durStr.toLongOrNull() ?: 0L
+            }
+
+            val wStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            val hStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            if (!wStr.isNullOrEmpty()) width = wStr.toIntOrNull() ?: 0
+            if (!hStr.isNullOrEmpty()) height = hStr.toIntOrNull() ?: 0
+
+            // Account for video orientation rotation
+            val rotStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+            val rotation = rotStr?.toIntOrNull() ?: 0
+            if (rotation == 90 || rotation == 270) {
+                val temp = width
+                width = height
+                height = temp
+            }
+
+            val brStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
+            if (!brStr.isNullOrEmpty()) {
+                videoBitrate = brStr.toLongOrNull() ?: 0L
+            }
+
+            val fpsStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            if (!fpsStr.isNullOrEmpty()) {
+                frameRate = fpsStr.toDoubleOrNull() ?: 0.0
+            }
+
+            val mimeStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
+            val containerFormat = if (!mimeStr.isNullOrEmpty()) mimeStr.substringAfterLast("/") else "mp4"
+
+            // Step 3: Inspect tracks via MediaExtractor
+            val numTracks = extractor.trackCount
+            for (i in 0 until numTracks) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+
+                if (mime.startsWith("video/") && videoTrackIndex == -1) {
+                    videoTrackIndex = i
+                    videoMime = mime
+                    if (width == 0 && format.containsKey(MediaFormat.KEY_WIDTH)) {
+                        width = format.getInteger(MediaFormat.KEY_WIDTH)
+                    }
+                    if (height == 0 && format.containsKey(MediaFormat.KEY_HEIGHT)) {
+                        height = format.getInteger(MediaFormat.KEY_HEIGHT)
+                    }
+                    if (frameRate == 0.0 && format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                        frameRate = format.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble()
+                    }
+                    if (durationMs == 0L && format.containsKey(MediaFormat.KEY_DURATION)) {
+                        durationMs = format.getLong(MediaFormat.KEY_DURATION) / 1000
+                    }
+                    if (videoBitrate == 0L && format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                        videoBitrate = format.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
+                    }
+                } else if (mime.startsWith("audio/") && audioTrackIndex == -1) {
+                    audioTrackIndex = i
+                    audioMime = mime
+                    hasAudio = true
+                    if (format.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                        audioChannels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                    }
+                    if (format.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                        audioSampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                    }
+                    if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                        audioBitrate = format.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
+                    }
+                }
+            }
+
+            // Step 4: Measure real keyframe interval and timestamp monotonicity
+            if (videoTrackIndex != -1) {
+                extractor.selectTrack(videoTrackIndex)
                 val syncTimesUs = mutableListOf<Long>()
                 var prevSampleTimeUs = -1L
                 val sampleBuffer = ByteBuffer.allocate(1024 * 128)
